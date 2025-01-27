@@ -1,0 +1,295 @@
+from nba_api.stats.endpoints import PlayerGameLogs, CommonPlayerInfo
+from nba_api.stats.static import players
+from nba_api.live.nba.endpoints import scoreboard
+import pandas as pd
+from datetime import datetime, timedelta
+import time
+import threading
+
+class NBADataManager:
+    def __init__(self):
+        self.player_ids = {}
+        self.cache = {}
+        self.cache_timeout = 300  # 5 minutes cache timeout
+
+    def get_player_id(self, player_name):
+        if player_name not in self.player_ids:
+            nba_players = players.get_players()
+            player = [p for p in nba_players if p['full_name'] == player_name]
+            if player:
+                self.player_ids[player_name] = player[0]['id']
+            else:
+                return None
+        return self.player_ids[player_name]
+
+    def get_player_stats(self, player_name, days=30):
+        cache_key = f"{player_name}_stats_{days}"
+        if cache_key in self.cache:
+            cache_time, data = self.cache[cache_key]
+            if time.time() - cache_time < self.cache_timeout:
+                return data
+
+        player_id = self.get_player_id(player_name)
+        if not player_id:
+            return None
+
+        # Get game logs for the specified number of days
+        game_logs = PlayerGameLogs(
+            player_id_nullable=player_id,
+            last_n_games_nullable=days
+        ).get_data_frames()[0]
+
+        # Convert to more manageable format
+        stats = []
+        for _, game in game_logs.iterrows():
+            stat = {
+                'date': game['GAME_DATE'],
+                'points': game['PTS'],
+                'rebounds': game['REB'],
+                'assists': game['AST'],
+                'steals': game['STL'],
+                'blocks': game['BLK'],
+                'minutes': game['MIN']
+            }
+            stats.append(stat)
+
+        self.cache[cache_key] = (time.time(), stats)
+        return stats
+
+    def get_player_info(self, player_name):
+        cache_key = f"{player_name}_info"
+        if cache_key in self.cache:
+            cache_time, data = self.cache[cache_key]
+            if time.time() - cache_time < self.cache_timeout:
+                return data
+
+        player_id = self.get_player_id(player_name)
+        if not player_id:
+            return None
+
+        player_info = CommonPlayerInfo(player_id=player_id).get_data_frames()[0]
+        info = {
+            'team': player_info['TEAM_NAME'][0],
+            'position': player_info['POSITION'][0],
+            'height': player_info['HEIGHT'][0],
+            'weight': player_info['WEIGHT'][0],
+            'country': player_info['COUNTRY'][0],
+            'experience': player_info['SEASON_EXP'][0]
+        }
+
+        self.cache[cache_key] = (time.time(), info)
+        return info
+
+    def get_live_games(self):
+        try:
+            board = scoreboard.ScoreBoard()
+            games = board.get_dict()
+            return games['scoreboard']['games']
+        except:
+            return []
+
+# Modified NBAStatsTracker class with API integration
+class NBAStatsTracker:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("NBA Stats Tracker")
+        self.root.geometry("1200x800")
+        
+        # Initialize API manager
+        self.data_manager = NBADataManager()
+        
+        # Initialize database
+        self.init_database()
+        
+        # Create main frames
+        self.create_frames()
+        
+        # Create navigation
+        self.create_navigation()
+        
+        # Initialize player data
+        self.load_player_data()
+        
+        # Create main content areas
+        self.create_stats_view()
+        self.create_comparison_view()
+        self.create_alerts_view()
+        
+        # Start real-time updates
+        self.start_live_updates()
+
+    def load_player_data(self):
+        # Get list of popular players
+        self.player_data = {
+            "LeBron James": {},
+            "Stephen Curry": {},
+            "Kevin Durant": {},
+            "Giannis Antetokounmpo": {},
+            "Luka Doncic": {}
+        }
+        
+        # Load initial data for each player
+        for player_name in self.player_data:
+            self.update_player_data(player_name)
+
+    def update_player_data(self, player_name):
+        try:
+            stats = self.data_manager.get_player_stats(player_name)
+            info = self.data_manager.get_player_info(player_name)
+            
+            if stats and info:
+                self.player_data[player_name] = {
+                    'info': info,
+                    'stats': stats
+                }
+                
+                # Update database
+                self.save_player_stats(player_name, stats)
+                
+                # Update UI if player is currently selected
+                if hasattr(self, 'player_var') and self.player_var.get() == player_name:
+                    self.update_stats_display(player_name)
+                    
+        except Exception as e:
+            print(f"Error updating data for {player_name}: {str(e)}")
+
+    def save_player_stats(self, player_name, stats):
+        player_id = self.get_or_create_player(player_name)
+        
+        for stat in stats:
+            self.cursor.execute('''
+                INSERT OR REPLACE INTO stats 
+                (player_id, date, points, rebounds, assists)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (player_id, stat['date'], stat['points'], 
+                 stat['rebounds'], stat['assists']))
+        
+        self.conn.commit()
+
+    def get_or_create_player(self, player_name):
+        self.cursor.execute('SELECT id FROM players WHERE name = ?', (player_name,))
+        result = self.cursor.fetchone()
+        
+        if result:
+            return result[0]
+        
+        self.cursor.execute(
+            'INSERT INTO players (name, team) VALUES (?, ?)',
+            (player_name, self.player_data[player_name].get('info', {}).get('team', 'Unknown'))
+        )
+        return self.cursor.lastrowid
+
+    def start_live_updates(self):
+        def update_loop():
+            while True:
+                # Update all player data
+                for player_name in self.player_data:
+                    self.update_player_data(player_name)
+                
+                # Check for alerts
+                self.check_alerts()
+                
+                # Get live games
+                live_games = self.data_manager.get_live_games()
+                self.update_live_games(live_games)
+                
+                # Wait for next update
+                time.sleep(300)  # Update every 5 minutes
+
+        # Start update thread
+        update_thread = threading.Thread(target=update_loop, daemon=True)
+        update_thread.start()
+
+    def update_stats_display(self, player_name):
+        # Clear previous stats
+        for item in self.stats_tree.get_children():
+            self.stats_tree.delete(item)
+        
+        # Get player stats
+        stats = self.player_data[player_name].get('stats', [])
+        
+        # Update treeview
+        for stat in stats:
+            self.stats_tree.insert('', 'end', values=(
+                stat['date'],
+                stat['points'],
+                stat['rebounds'],
+                stat['assists']
+            ))
+        
+        # Update graph
+        self.update_stats_graph(stats)
+
+    def update_stats_graph(self, stats):
+        self.ax.clear()
+        
+        dates = [stat['date'] for stat in stats]
+        points = [stat['points'] for stat in stats]
+        
+        self.ax.plot(dates, points, marker='o')
+        self.ax.set_title('Points Trend')
+        self.ax.set_xlabel('Date')
+        self.ax.set_ylabel('Points')
+        
+        # Rotate x-axis labels for better readability
+        plt.xticks(rotation=45)
+        
+        # Adjust layout to prevent label cutoff
+        plt.tight_layout()
+        
+        self.canvas.draw()
+
+    def update_live_games(self, games):
+        # Create or update live games frame
+        if not hasattr(self, 'live_games_frame'):
+            self.live_games_frame = ttk.Frame(self.content_frame)
+            self.live_games_label = ttk.Label(self.live_games_frame, 
+                                            text="Live Games", 
+                                            font=('Arial', 12, 'bold'))
+            self.live_games_label.pack(pady=5)
+            
+            self.live_games_tree = ttk.Treeview(self.live_games_frame,
+                                              columns=('Home', 'Score', 'Away'),
+                                              show='headings')
+            self.live_games_tree.heading('Home', text='Home')
+            self.live_games_tree.heading('Score', text='Score')
+            self.live_games_tree.heading('Away', text='Away')
+            self.live_games_tree.pack(pady=5, fill=tk.X)
+
+        # Clear previous games
+        for item in self.live_games_tree.get_children():
+            self.live_games_tree.delete(item)
+
+        # Add current games
+        for game in games:
+            home_team = game['homeTeam']['teamName']
+            away_team = game['awayTeam']['teamName']
+            score = f"{game['homeTeam']['score']} - {game['awayTeam']['score']}"
+            
+            self.live_games_tree.insert('', 'end', values=(home_team, score, away_team))
+
+    def check_alerts(self):
+        self.cursor.execute('''
+            SELECT alerts.*, players.name 
+            FROM alerts 
+            JOIN players ON alerts.player_id = players.id
+        ''')
+        alerts = self.cursor.fetchall()
+        
+        for alert in alerts:
+            player_name = alert[4]  # name from players table
+            stat_type = alert[2]
+            threshold = alert[3]
+            
+            if player_name in self.player_data:
+                latest_stats = self.player_data[player_name].get('stats', [])[0]
+                if latest_stats:
+                    stat_value = latest_stats.get(stat_type.lower(), 0)
+                    if stat_value >= threshold:
+                        self.show_alert(player_name, stat_type, stat_value, threshold)
+
+    def show_alert(self, player_name, stat_type, value, threshold):
+        messagebox.showinfo(
+            "Stat Alert",
+            f"{player_name} has reached {value} {stat_type} (Threshold: {threshold})"
+        )
