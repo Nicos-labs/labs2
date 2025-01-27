@@ -1,0 +1,6 @@
+pip install nba_api
+pip install pandas
+pip install matplotlib
+pip install requests
+
+
